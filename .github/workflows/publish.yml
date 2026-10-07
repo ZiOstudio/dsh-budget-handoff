@@ -45,12 +45,18 @@ jobs:
       # This step says which of the two it is, without printing the token.
       - name: Diagnose auth
         run: |
-          echo "NODE_AUTH_TOKEN length: ${#NODE_AUTH_TOKEN}"
-          echo "registry: $(npm config get registry)"
-          echo "--- ~/.npmrc (auth token redacted) ---"
-          sed 's/_authToken=.*/_authToken=REDACTED/' ~/.npmrc 2>/dev/null || echo "(no ~/.npmrc)"
+          echo "length: ${#NODE_AUTH_TOKEN}"
+          echo "prefix: ${NODE_AUTH_TOKEN:0:4}..."
+          if printf '%s' "$NODE_AUTH_TOKEN" | grep -qE '^[[:space:]]|[[:space:]]$'; then
+            echo "whitespace: *** TOKEN HAS LEADING OR TRAILING WHITESPACE ***"
+          else
+            echo "whitespace: clean"
+          fi
+          echo "--- npm config file actually in use ---"
+          echo "NPM_CONFIG_USERCONFIG=${NPM_CONFIG_USERCONFIG:-<unset>}"
+          cat "${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}" 2>/dev/null | sed 's/_authToken=.*/_authToken=REDACTED/' || echo "(none readable)"
           echo "--- whoami ---"
-          npm whoami 2>&1 || echo "(whoami failed: the token is not being accepted)"
+          npm whoami 2>&1 || echo "(whoami failed)"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
