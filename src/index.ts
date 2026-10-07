@@ -4,9 +4,12 @@
 // uses the `ctx` the host hands it, and every type import below is erased at
 // compile time (`import type`), so nothing is imported at runtime.
 //
+// 空类型 import：触发 @deepseek-ai/dsh-agent 对 cordis `Events` 接口的声明合并，
+// 让 ctx.on('agent/pre-step', ...) 能通过类型检查。不要删。
+// （v0.1.1 删掉 tools/pre-execute 处理器后，原本靠 dsh-tools 传递进来的声明链断了。）
+import type {} from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 import { Ledger } from './ledger.js'
 import { calculateCost, isPeakHour } from './pricing.js'
@@ -50,25 +53,62 @@ export const Config: z<Config> = z.object({
 // Plugin display name, shown in loader diagnostics.
 export const name = 'dsh-budget-handoff'
 
-export function apply(ctx: Context, config: Config) {
-  let sessionEvents = 0
-  let toolChanges = 0
-  let toolPreExecutes = 0
+// ── Recent-event ring buffer for the hand-off snapshot ───────────────────────
+/** 每个会话最多保留的事件摘要条数（与 snapshot.ts 的 MAX_RECENT_EVENTS 一致）。 */
+const MAX_RECENT_EVENTS = 10
 
+/**
+ * 把一条会话事件压成一行短摘要；不关心的事件返回 null。
+ *
+ * 字段名全部实测查证（不靠猜）：
+ * - `@deepseek-ai/dsh-session\lib\types\types.d.ts:255-388`：`step/end{turn,step}`、
+ *   `tool/call{turn,step,callId,name,arguments}`、`tool/result{turn,step,message,error?}`
+ *   （**没有** name/isError 顶层字段）、`assistant/message{…,usage?:TokenUsage}`、
+ *   `turn/start{turn}`、`turn/end{turn,reason}`。
+ * - `@deepseek-ai/dsh-llm\lib\types\message.d.ts:153-160`：`ToolResultMessage` 上才有
+ *   `toolCallId` 与 `isError?`（工具名不在结果消息里，故用 callId 关联）。
+ * - `@deepseek-ai/dsh-llm\lib\types\types.d.ts:160-174`：`TokenUsage.totalTokens?` 可选。
+ */
+function summarizeEvent(event: SessionEvent): string | null {
+  switch (event.type) {
+    case 'step/end':
+      return `step/end turn=${event.data.turn} step=${event.data.step}`
+    case 'tool/call':
+      return `tool/call name=${event.data.name}`
+    case 'tool/result':
+      return `tool/result callId=${event.data.message.toolCallId} isError=${event.data.message.isError ?? false}`
+    case 'assistant/message':
+      return `assistant/message total=${event.data.usage?.totalTokens ?? '?'} tokens`
+    case 'turn/start':
+      return `turn/start turn=${event.data.turn}`
+    case 'turn/end':
+      return `turn/end reason=${event.data.reason?.kind ?? '?'}`
+    default:
+      return null
+  }
+}
+
+export function apply(ctx: Context, config: Config) {
   // Cumulative token accounting, one record per session.
   const ledger = new Ledger()
 
   // Cumulative CNY spend, one total per session.
   const sessionCosts = new Map<string, number>()
 
+  // 每会话的最近事件摘要（环缓冲），供交接快照的 recentEvents 使用。
+  const recentEventsBySession = new Map<string, string[]>()
+
   // ① Durable session firehose (emit): fires whenever a session's log grows —
   //    turn/step boundaries, user/assistant messages, tool results, …
   ctx.on('session/event', (session: Session, event: SessionEvent) => {
-    sessionEvents += 1
-    if (sessionEvents <= 5 || sessionEvents % 25 === 0) {
-      console.log(
-        `[dsh-budget-handoff] session/event #${sessionEvents} type=${event.type} session=${String(session.id)}`,
-      )
+    // 最近事件环缓冲：放在任何分支之前，保证每条事件都被记录。
+    const sessionId = String(session.id)
+    const summary = summarizeEvent(event)
+    if (summary !== null) {
+      const arr = recentEventsBySession.get(sessionId) ?? []
+      arr.push(summary)
+      while (arr.length > MAX_RECENT_EVENTS) arr.shift()
+      recentEventsBySession.set(sessionId, arr)
     }
 
     // Token accounting. `SessionEvent` nests its payload under `data`
@@ -91,12 +131,10 @@ export function apply(ctx: Context, config: Config) {
           (usage.cacheWriteTokens ?? 0) +
           usage.outputTokens
         ledger.record(String(session.id), provider, model, usage)
+        // `totalTokens` 是 TokenUsage 的可选字段（dsh-llm\lib\types\types.d.ts:170），
+        // provider 未提供时回退到四桶求和 callTotal，保证这一行总有数字。
         console.log(
-          `[dsh-budget-handoff] usage recorded provider=${provider} model=${model} uncachedInput=${usage.inputTokens} cacheRead=${usage.cacheReadTokens ?? 0} cacheWrite=${usage.cacheWriteTokens ?? 0} output=${usage.outputTokens} total=${callTotal}`,
-        )
-        const cumulative = ledger.get(String(session.id))
-        console.log(
-          `[dsh-budget-handoff] usage cumulative session=${String(session.id)} uncachedInput=${cumulative?.uncachedInputTokens ?? 0} cacheRead=${cumulative?.cacheReadTokens ?? 0} cacheWrite=${cumulative?.cacheWriteTokens ?? 0} output=${cumulative?.outputTokens ?? 0} totalTokens=${cumulative?.totalTokens ?? 0}`,
+          `[dsh-budget-handoff] usage provider=${provider} model=${model} total=${usage.totalTokens ?? callTotal} tokens`,
         )
 
         // Money layer: price this call against the peak/off-peak table and fold
@@ -107,7 +145,7 @@ export function apply(ctx: Context, config: Config) {
           const cumulativeCost = (sessionCosts.get(String(session.id)) ?? 0) + cost
           sessionCosts.set(String(session.id), cumulativeCost)
           console.log(
-            `[dsh-budget-handoff] cost session=${String(session.id)} provider=${provider} model=${model} peak=${isPeak} thisCall=${cost.toFixed(4)} 累计=${cumulativeCost.toFixed(4)} 元`,
+            `[dsh-budget-handoff] cost thisCall=${cost.toFixed(4)} 累计=${cumulativeCost.toFixed(4)} 元`,
           )
         } else {
           console.error(
@@ -119,21 +157,6 @@ export function apply(ctx: Context, config: Config) {
         }
       }
     }
-  })
-
-  // ② Live registry change (emit): fires the moment any tool is registered or
-  //    unregistered — including by sibling plugins in the same composition.
-  ctx.on('tools/change', () => {
-    toolChanges += 1
-    console.log(`[dsh-budget-handoff] tools/change #${toolChanges}`)
-  })
-
-  // ③ Tool execution pipeline (waterfall): log, then delegate with next().
-  //    NOT calling next() would short-circuit and block the tool call.
-  ctx.on('tools/pre-execute', (exec: ToolExecution, next: () => Promise<PreToolDecision>) => {
-    toolPreExecutes += 1
-    console.log(`[dsh-budget-handoff] tools/pre-execute #${toolPreExecutes} tool=${exec.name}`)
-    return next()
   })
 
   // ④ Budget gate (waterfall): the last line of defence before a step is
@@ -151,7 +174,7 @@ export function apply(ctx: Context, config: Config) {
         spentCNY: spent,
         budgetCNY: config.budgetCNY,
         reason: `session spent ${spent.toFixed(4)} CNY >= budget ${config.budgetCNY.toFixed(4)} CNY`,
-        recentEvents: [], // 本 MVP 先留空，后续可加
+        recentEvents: recentEventsBySession.get(sessionId) ?? [],
       })
       try {
         const noticeText = [
@@ -188,21 +211,14 @@ export function apply(ctx: Context, config: Config) {
     return next()
   })
 
-  // ⑤ ctx.on() is already an EFFECT (auto-disposed on unload). For a resource
-  //    Cordis does NOT manage (a timer/connection/watcher), wrap it in
-  //    ctx.effect() and return a disposer — the reversible-cleanup proof:
-  //    unload this plugin and watch the DISPOSED line print.
+  // ⑤ ctx.on() is already an EFFECT (auto-disposed on unload). The 30s heartbeat
+  //    timer was removed in v0.1.1 (pure noise); this empty effect is kept only
+  //    so the reversible-cleanup proof — the DISPOSED line on unload — survives.
   ctx.effect(() => {
-    const timer = setInterval(() => {
-      console.log(
-        `[dsh-budget-handoff] heartbeat sessionEvents=${sessionEvents} toolPreExecutes=${toolPreExecutes} toolChanges=${toolChanges}`,
-      )
-    }, 30_000)
     return () => {
-      clearInterval(timer)
-      console.log(`[dsh-budget-handoff] DISPOSED — listeners removed, timer cleared`)
+      console.log(`[dsh-budget-handoff] DISPOSED — listeners removed`)
     }
   })
 
-  console.log(`[dsh-budget-handoff] listeners registered: session/event + tools/change + tools/pre-execute | resolved budget=${config.budgetCNY} CNY priceTablePath='${config.priceTablePath}'`)
+  console.log(`[dsh-budget-handoff] 已加载，预算 ${config.budgetCNY} CNY`)
 }

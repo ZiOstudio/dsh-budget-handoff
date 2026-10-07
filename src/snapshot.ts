@@ -32,13 +32,16 @@ const SNAPSHOT_FILE_NAME = 'BUDGET-STOPPED-handoff-snapshot.md'
 
 const NEXT_STEP_HINT = '请检查以上事件，确认任务进度，调整预算后继续。'
 
-/** Render the snapshot as Markdown. Pure function: no I/O, no clock reads except `new Date()`. */
+/** Render the snapshot as Markdown. Pure function: no I/O, one clock read. */
 export function buildSnapshot(input: SnapshotInput): string {
   const recentEvents = input.recentEvents.slice(-MAX_RECENT_EVENTS)
   const lines: string[] = [
     '# DSH 预算交接快照',
     '',
-    `- 生成时间：${new Date().toISOString()}`,
+    // 北京时间（UTC+8）——快照的读者是人，ISO 的 UTC 时间对中文用户不友好。
+    // 用固定 +8h 偏移把 UTC 墙钟换成北京墙钟，再显式标注 (UTC+8)（与 pricing.ts 的
+    // isPeakHour 同一做法；本插件不做夏令时）。
+    `- 生成时间：${new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().replace('Z', ' (UTC+8)').replace('T', ' ')}`,
     `- 会话 ID：${input.sessionId}`,
     `- 触发位置：turn=${input.turn}, step=${input.step}`,
     `- 触发原因：${input.reason}`,
