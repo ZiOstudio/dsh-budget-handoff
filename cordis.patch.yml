@@ -1,0 +1,14 @@
+# dsh-budget-handoff bundle layer — applied when a profile lists this bundle
+# (package.json declares `dsh.bundle.patch` pointing at this file).
+#
+# PITFALL: `name` is a PACKAGE NAME (resolved through the profile's node_modules
+# or the installation fallback `$DSH_HOME/profiles/node_modules`), NOT a
+# relative path. `dsh-budget-handoff` is this package's main entry (→ dist/index.js).
+- insert:
+    - id: dsh-budget-handoff
+      name: dsh-budget-handoff
+      # 插件配置：由 src/index.ts 导出的 schemastery `Config` schema 校验并回填默认值。
+      # 所有字段都可选；这里写出 budgetCNY 的默认值作为示例，删掉本段则完全用
+      # schema 默认值（budgetCNY: 1.0、priceTablePath: ''）。
+      config:
+        budgetCNY: 1.0

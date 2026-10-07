@@ -1,0 +1,22 @@
+# 依赖
+node_modules/
+
+# 备份文件
+*.bak
+*.bak-v*
+
+# 运行时产物（快照文件不应入库）
+BUDGET-STOPPED-handoff-snapshot.md
+BUDGET-STOPPED-handoff-snapshot.test.md
+handoff-snapshot.md
+last-stop.md
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# 临时脚本
+test-*.mjs
