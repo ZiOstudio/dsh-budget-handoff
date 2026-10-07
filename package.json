@@ -20,12 +20,15 @@
   "exports": {
     ".": "./dist/index.js"
   },
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0-rc.2"
+  },
   "files": [
     "dist",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE",
-    "src/pricing.json"
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
