@@ -41,7 +41,11 @@ const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
  * @param date - the moment to judge (its instant is what matters, not the local
  *   zone of the caller: the input is converted to Beijing wall-clock time).
  * @returns `true` for Monday–Friday 09:00–12:00 / 14:00–18:00 Beijing time,
- *   `false` for everything else (weekends, nights, lunch break, holidays).
+ *   `false` for everything else (weekends, nights, lunch break).
+ *
+ *   **Chinese statutory holidays are NOT modelled** (see the module header), so a
+ *   holiday falling on a weekday inside those windows returns `true` and is billed
+ *   at the peak rate — i.e. this function **over-charges on holidays**.
  */
 export function isPeakHour(date) {
     // Shift the instant by +8h and then read it back as UTC: the UTC getters now

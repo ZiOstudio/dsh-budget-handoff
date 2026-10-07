@@ -1,6 +1,6 @@
 {
   "name": "dsh-budget-handoff",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "DeepSeek Harness 会话预算插件：按官方价目表实时算账，预算耗尽时拦截任务并落盘交接快照。",
   "license": "MIT",
   "keywords": [
@@ -48,5 +48,10 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.4"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
   }
 }

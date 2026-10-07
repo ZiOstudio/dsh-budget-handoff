@@ -8,7 +8,6 @@
     - id: dsh-budget-handoff
       name: dsh-budget-handoff
       # 插件配置：由 src/index.ts 导出的 schemastery `Config` schema 校验并回填默认值。
-      # 所有字段都可选；这里写出 budgetCNY 的默认值作为示例，删掉本段则完全用
-      # schema 默认值（budgetCNY: 1.0、priceTablePath: ''）。
-      config:
-        budgetCNY: 1.0
+      # 这里刻意**不写 config** —— 默认值只在 schema 里定义一处（src/index.ts 的
+      # `Config`），避免两处常量各自漂移：本文件曾把 budgetCNY 写成 1.0，而 schema
+      # 已改成 10.0，结果默认值被这里的旧数字静默覆盖（2026-10-08 实测发现）。
