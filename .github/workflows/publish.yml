@@ -39,6 +39,21 @@ jobs:
           node dist/pricing.test.js
           node dist/snapshot.test.js
 
+      # Diagnostic: a 404 on PUT usually means the token is missing, not that the
+      # name is taken. npm answers 404 rather than 401/403 for an unauthenticated
+      # PUT on purpose, so the registry cannot be probed for which names exist.
+      # This step says which of the two it is, without printing the token.
+      - name: Diagnose auth
+        run: |
+          echo "NODE_AUTH_TOKEN length: ${#NODE_AUTH_TOKEN}"
+          echo "registry: $(npm config get registry)"
+          echo "--- ~/.npmrc (auth token redacted) ---"
+          sed 's/_authToken=.*/_authToken=REDACTED/' ~/.npmrc 2>/dev/null || echo "(no ~/.npmrc)"
+          echo "--- whoami ---"
+          npm whoami 2>&1 || echo "(whoami failed: the token is not being accepted)"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Publish
         run: npm publish
         env:
