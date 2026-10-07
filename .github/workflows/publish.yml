@@ -1,0 +1,45 @@
+name: Publish to npm
+
+# Two ways to trigger:
+#   1. push a version tag (v0.2.1, v0.3.0, …) → automatic
+#   2. the "Run workflow" button on the Actions tab → manual, one click
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # No `npm install` / `pnpm install` on purpose: `dist/` is committed, so
+      # there is nothing to build here. Installing would also pull the
+      # @deepseek-ai/* dev dependencies, which the runner has no business
+      # fetching just to publish an already-built artifact.
+      #
+      # This does mean the committed `dist/` must be current. The self-check
+      # below runs the compiled tests as a smoke test: if the build were stale
+      # or broken, these fail before anything reaches the registry.
+      - name: Self-check the committed build
+        run: |
+          node dist/command.test.js
+          node dist/harvest.test.js
+          node dist/ledger.test.js
+          node dist/pricing.test.js
+          node dist/snapshot.test.js
+
+      - name: Publish
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
