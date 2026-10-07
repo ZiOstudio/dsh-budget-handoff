@@ -20,3 +20,4 @@ Thumbs.db
 
 # 临时脚本
 test-*.mjs
+_backups/
