@@ -11,7 +11,11 @@
     "handoff",
     "cost-control"
   ],
-  "repository": "github:ZiOstudio/dsh-budget-handoff",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZiOstudio/dsh-budget-handoff.git",
+    "directory": "."
+  },
   "author": "ZiOstudio",
   "homepage": "https://github.com/ZiOstudio/dsh-budget-handoff#readme",
   "bugs": "https://github.com/ZiOstudio/dsh-budget-handoff/issues",
