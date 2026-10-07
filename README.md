@@ -2,6 +2,10 @@
 
 > 给 DeepSeek Harness 的会话设个预算上限：**花完就停，并留下一份能接着干活的交接单。**
 
+[![Stars](https://img.shields.io/github/stars/ZiOstudio/dsh-budget-handoff?style=social)](https://github.com/ZiOstudio/dsh-budget-handoff/stargazers)
+[![Forks](https://img.shields.io/github/forks/ZiOstudio/dsh-budget-handoff?style=social)](https://github.com/ZiOstudio/dsh-budget-handoff/network/members)
+[![License](https://img.shields.io/github/license/ZiOstudio/dsh-budget-handoff?style=flat-square)](LICENSE)
+
 ## 用法
 
 **装**（一条命令，装完**重启 DSH**）：
@@ -276,6 +280,12 @@ agent/request-error →  余额耗尽兜底
 ```
 
 ---
+
+## Star
+
+如果这个插件帮你省下过真金白银——尤其是那种「一觉醒来，发现钱烧完了、活也停了」的场景——点个 Star，让更多正在踩这个坑的人看到它。
+
+它不需要你花钱，也不需要你注册账号，就是让这个仓库在搜索和推荐里更容易被找到。
 
 ## License
 
