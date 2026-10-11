@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  self-check:
+    name: self-check (no install)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      # dist/ 已入库，且测试文件只依赖 node 内置模块 —— 所以这里零安装直跑。
+      # 这也正是「源码安装」用户拿到的代码路径：先确认它自己站得住。
+      - name: Run the committed self-tests
+        run: |
+          fail=0
+          for f in dist/*.test.js; do
+            echo "== $f"
+            node "$f" || fail=1
+          done
+          exit $fail
+
+      - name: Check every dist file parses
+        run: |
+          for f in dist/*.js; do node --check "$f"; done
+
+      - name: Sanity-check the manifest
+        run: |
+          jq -e '.name and .version and .main' package.json > /dev/null
+          jq -e '.dsh.bundle.patch' package.json > /dev/null
+          test -f cordis.patch.yml
+          test -f LICENSE
+          node -e "const p=JSON.parse(require('fs').readFileSync('package.json','utf8'));const need=['dist','cordis.patch.yml','README.md','LICENSE'];for(const f of need){if(!p.files.includes(f)){throw new Error('files[] 缺少 '+f)}}console.log('manifest ok:',p.name,p.version)"

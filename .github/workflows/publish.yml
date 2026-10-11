@@ -16,9 +16,9 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
@@ -60,7 +60,20 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # Idempotent on purpose: re-pushing an existing tag (or running the
+      # workflow twice) used to end in
+      #   npm error code E403 … You cannot publish over the previously
+      #   published versions: 0.2.0
+      # which reads like a broken token but is just a duplicate version.
+      # Skipping when the version is already on the registry keeps re-runs green.
       - name: Publish
-        run: npm publish
+        run: |
+          name=$(npm pkg get name | tr -d '"')
+          version=$(npm pkg get version | tr -d '"')
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version 已在 npm 上，跳过发布。"
+          else
+            npm publish
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

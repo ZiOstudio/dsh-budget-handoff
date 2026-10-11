@@ -11,14 +11,21 @@
 **装**（一条命令，装完**重启 DSH**）：
 
 ```sh
+# 推荐：装 npm 上的预构建包（免构建脚本，也不需要 allowBuilds 批准）
+dsh plugin --profile <你的profile> add dsh-budget-handoff
+
+# 或者：直接装源码仓库
 dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 ```
 
-> **想固定在某个版本**（不随主分支漂移，便于复现同样的行为），在末尾加 `#v0.2.0`：
+> **想固定在某个版本**（不随主分支漂移，便于复现同样的行为），在末尾加版本号：
 >
 > ```sh
-> dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff#v0.2.0
+> dsh plugin --profile <你的profile> add dsh-budget-handoff@0.2.1
+> dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff#v0.2.1
 > ```
+>
+> 源码安装会从 npm 拉开发依赖来跑构建；若被 pnpm 拦下，按提示把该包加进 profile 的 `allowBuilds`，或直接改用上面的 npm 包。
 
 **然后在会话里直接发这三条**：
 
@@ -280,6 +287,10 @@ agent/request-error →  余额耗尽兜底
 ```
 
 ---
+
+## 变更日志
+
+每个版本改了什么、为什么改，见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## Star
 
