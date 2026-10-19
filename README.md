@@ -21,8 +21,8 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 > **想固定在某个版本**（不随主分支漂移，便于复现同样的行为），在末尾加版本号：
 >
 > ```sh
-> dsh plugin --profile <你的profile> add dsh-budget-handoff@0.2.1
-> dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff#v0.2.1
+> dsh plugin --profile <你的profile> add dsh-budget-handoff@0.2.2
+> dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff#v0.2.2
 > ```
 >
 > 源码安装会从 npm 拉开发依赖来跑构建；若被 pnpm 拦下，按提示把该包加进 profile 的 `allowBuilds`，或直接改用上面的 npm 包。

@@ -2,7 +2,9 @@
 
 本文件记录 `dsh-budget-handoff` 的每个发布版本。版本号遵循语义化版本；对应 npm 上的同名包与 GitHub 上的 `vX.Y.Z` tag。
 
-## 未发布
+## 0.2.2 — 2026-10-19
+
+两处修正，行为不变（`dist/` 重新构建过）。
 
 - **修正价格表路径指引**：拦停通知与 README 原本让人「把价格补进 `src/pricing.json`」，但发到 npm 的包里只有 `dist/`，装市场版的人根本找不到 `src/`。改为指向 `dist/pricing.json`，并说明改 `src/pricing.json` 需重新构建才生效（`src/index.ts`、`README.md`）。
 - **写快照失败不再连累拦停**：`writeHandoffOut` 里两次落盘（工作目录 / `$DSH_HOME`）各自包 try。此前工作目录不可写时异常会从 `agent/pre-step` 逃出去，导致 `return { kind: 'reject' }` 执行不到 —— **预算超了却放行**，闸门 fail-open。现在写失败只降级通知文案（说明哪一处失败、原因是什么），拦停照旧。
