@@ -213,7 +213,9 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 
 ## 价格表
 
-`src/pricing.json`，结构 `provider → model → { cacheRead, cacheMiss, output }`，
+`dist/pricing.json`（**注意是 `dist/`，不是 `src/`**：发到 npm 的包里只有 `dist`，
+运行时读的也是 `dist/pricing.json`；`src/pricing.json` 是它的源，改完要重新构建才生效），
+结构 `provider → model → { cacheRead, cacheMiss, output }`，
 每个桶含 `offPeak` / `peak` 两档。**单位：人民币元 / 百万 token。**
 
 覆盖范围（只覆盖 DeepSeek 官方）：
@@ -243,7 +245,7 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 [预算] ⚠️ 预算保护已失效
 原因：价目表里没有 <provider>/<model> 的价格，本插件无法为它计费
 后果：本会话的消费不再累计，也不会在超支时拦停
-怎么修：改用价目表里已有的模型，或把该模型的价格补进 src/pricing.json
+怎么修：改用价目表里已有的模型，或把该模型的价格补进 dist/pricing.json（安装包里的价目表）
 ```
 
 （同一会话里同一个模型只提示一次。）
@@ -257,7 +259,7 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 3. **只覆盖 `deepseek-official`**：其他 provider 走「价格未知 → 保护失效 → 明确告知」。
 4. **跨进程不累计**：累计消费与 `/budget` 设的预算都是内存值，进程重启即归零，也不跨会话共享。
 5. **法定节假日未建模**：节假日仍按工作日窗口判高峰（见上文警告）。
-6. **价格不会自动更新**：官方调价需要手动改 `src/pricing.json` 并重新构建。
+6. **价格不会自动更新**：官方调价需要手动改 `dist/pricing.json`（改 `src/pricing.json` 则要重新构建）并重新安装插件。
 
 ---
 

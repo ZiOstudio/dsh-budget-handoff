@@ -239,8 +239,44 @@ export function apply(ctx: Context, config: Config) {
     })
 
     // 先落盘、再通知：通知里必须写**真实**路径。
-    const workdirPath = writeSnapshot(snapshot, options.workdir)
-    const dshHomePath = writeSnapshotToDshHome(snapshot)
+    //
+    // 两次落盘各自兜住 —— 这个函数跑在 `agent/pre-step` 里，抛出去就意味着下面那句
+    // `return { kind: 'reject' }` 永远不执行：预算闸门 fail-open，用户却以为有保护。
+    // 写失败只降级通知文案（少一行路径、多一行原因），拦停照旧。
+    let workdirPath: string | undefined
+    let workdirError: string | undefined
+    try {
+      workdirPath = writeSnapshot(snapshot, options.workdir)
+    } catch (err) {
+      workdirError = String(err)
+      console.error(`[dsh-budget-handoff] failed to write snapshot to workdir: ${workdirError}`)
+    }
+
+    let dshHomePath: string | undefined
+    let dshHomeError: string | undefined
+    try {
+      dshHomePath = writeSnapshotToDshHome(snapshot)
+    } catch (err) {
+      dshHomeError = String(err)
+      console.error(`[dsh-budget-handoff] failed to write snapshot to DSH_HOME: ${dshHomeError}`)
+    }
+
+    const writtenLines: string[] = []
+    if (workdirPath !== undefined && dshHomePath !== undefined) {
+      writtenLines.push('交接快照已写入：', `  1. ${workdirPath}`, `  2. ${dshHomePath}`)
+    } else if (workdirPath !== undefined || dshHomePath !== undefined) {
+      writtenLines.push(
+        '交接快照只写成功了一处：',
+        workdirPath !== undefined ? `  1. ${workdirPath}` : `  1. （工作目录写入失败：${workdirError}）`,
+        dshHomePath !== undefined ? `  2. ${dshHomePath}` : `  2. （DSH_HOME 写入失败：${dshHomeError}）`,
+      )
+    } else {
+      writtenLines.push(
+        '⚠️ 交接快照两处都没写成功 —— 任务已停止，但断点没有落盘：',
+        `  1. 工作目录：${workdirError}`,
+        `  2. DSH_HOME：${dshHomeError}`,
+      )
+    }
 
     try {
       options.appendNotice(
@@ -248,14 +284,14 @@ export function apply(ctx: Context, config: Config) {
           options.headline,
           ...(options.extraLine !== undefined ? [options.extraLine] : []),
           `累计消费：${options.spentCNY.toFixed(4)} 元 / 预算：${options.budgetCNY.toFixed(4)} 元`,
-          `交接快照已写入：`,
-          `  1. ${workdirPath}`,
-          `  2. ${dshHomePath}`,
-          `打开快照可以看到「干到哪了 / 动过哪些文件 / 怎么接着干」。`,
+          ...writtenLines,
+          '打开快照可以看到「干到哪了 / 动过哪些文件 / 怎么接着干」。',
         ].join('\n'),
       )
       options.injectContext(snapshot)
-      if (config.verbose) console.log(`[dsh-budget-handoff] handoff written: ${workdirPath}`)
+      if (config.verbose) {
+        console.log(`[dsh-budget-handoff] handoff written: ${workdirPath ?? dshHomePath ?? '(none)'}`)
+      }
     } catch (err) {
       console.error(`[dsh-budget-handoff] failed to append notice: ${String(err)}`)
     }
@@ -265,9 +301,7 @@ export function apply(ctx: Context, config: Config) {
     console.error(
       `[dsh-budget-handoff] 累计消费：${options.spentCNY.toFixed(4)} 元 / 预算：${options.budgetCNY.toFixed(4)} 元`,
     )
-    console.error(`[dsh-budget-handoff] 交接快照已写入：`)
-    console.error(`[dsh-budget-handoff]   1. ${workdirPath}`)
-    console.error(`[dsh-budget-handoff]   2. ${dshHomePath}`)
+    for (const line of writtenLines) console.error(`[dsh-budget-handoff] ${line}`)
   }
 
   // ① Durable session firehose (emit): fires whenever a session's log grows —
@@ -337,7 +371,7 @@ export function apply(ctx: Context, config: Config) {
             `[dsh-budget-handoff] ⚠️ 未知 provider/model: ${provider}/${model} — 本插件无法为其计费，预算保护已失效`,
           )
           console.error(
-            `[dsh-budget-handoff]    如果你在用自定义 provider 或新模型，请更新 src/pricing.json 或换用已知模型`,
+            `[dsh-budget-handoff]    如果你在用自定义 provider 或新模型，请更新 dist/pricing.json（安装包里的价目表）或换用已知模型`,
           )
 
           // A7：把「保护已失效」从终端搬到会话里。GUI 用户看不到 stdout，原来那两句
@@ -353,7 +387,7 @@ export function apply(ctx: Context, config: Config) {
                 `[预算] ⚠️ 预算保护已失效`,
                 `原因：价目表里没有 ${provider}/${model} 的价格，本插件无法为它计费`,
                 `后果：本会话的消费不再累计，也不会在超支时拦停`,
-                `怎么修：改用价目表里已有的模型，或把该模型的价格补进 src/pricing.json`,
+                `怎么修：改用价目表里已有的模型，或把该模型的价格补进 dist/pricing.json（安装包里的价目表）`,
               ].join('\n'),
             )
             pendingNoticesBySession.set(String(session.id), queue)
