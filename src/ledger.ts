@@ -33,6 +33,22 @@ export interface UsageSample {
   reasoningTokens?: number
 }
 
+/**
+ * How much one cache-read token counts toward the token ceiling.
+ *
+ * WHY NOT 1.0: DeepSeek bills a cache hit at 0.02 元 / 1M against 1.0 元 / 1M for
+ * a miss (see `pricing.json`) — a 50× discount. Counting a cached token the same
+ * as a fresh one makes the token ceiling a liar in the other direction: a long
+ * cached conversation reaches "5,000,000 tokens" while having cost a few 分.
+ *
+ * WHY 0.1 AND NOT 0.02: the ceiling is a magnitude guard, not an invoice. The
+ * exact 1/50 ratio would let a session with huge cached context run to a hundred
+ * million raw tokens before the guard moved, which is the failure mode the
+ * ceiling exists to prevent. 0.1 keeps cache reads cheap without making them
+ * free: a 10× discount, deliberately conservative.
+ */
+export const CACHE_READ_WEIGHT = 0.1
+
 /** Cumulative accounting for one session, across every recorded call. */
 export interface SessionUsage {
   /** Session id the samples were recorded under. */
@@ -53,6 +69,15 @@ export interface SessionUsage {
   reasoningTokens: number
   /** Billed total: the sum of the four disjoint token buckets above. */
   totalTokens: number
+  /**
+   * Weighted total used by the token ceiling: like {@link totalTokens}, but
+   * cache reads count as {@link CACHE_READ_WEIGHT} of a fresh token.
+   *
+   * Two numbers, two jobs: `totalTokens` is what the provider billed and what
+   * the receipts show; `effectiveTokens` is what the ceiling judges. Rendering
+   * the weighted number as "tokens used" would understate the real traffic.
+   */
+  effectiveTokens: number
   /** Epoch milliseconds of the most recent `record` call for this session. */
   updatedAt: number
 }
@@ -89,6 +114,11 @@ export class Ledger {
     // bucket sum is always defined and matches what the provider bills.
     const totalTokens = uncachedInputTokens + cacheReadTokens + cacheWriteTokens + outputTokens
 
+    // Same sum, but cache reads at their discounted weight. Kept as a running
+    // sum of the same buckets so it can never drift from `totalTokens`.
+    const effectiveTokens =
+      uncachedInputTokens + cacheReadTokens * CACHE_READ_WEIGHT + cacheWriteTokens + outputTokens
+
     const next: SessionUsage = {
       sessionId,
       provider,
@@ -99,6 +129,7 @@ export class Ledger {
       outputTokens,
       reasoningTokens,
       totalTokens,
+      effectiveTokens,
       updatedAt: Date.now(),
     }
     this.bySession.set(sessionId, next)
@@ -113,6 +144,28 @@ export class Ledger {
    */
   get(sessionId: string): SessionUsage | null {
     return this.bySession.get(sessionId) ?? null
+  }
+
+  /**
+   * Install a previously persisted record, replacing any in-memory one.
+   *
+   * Used once per session at startup to undo the "restart wipes the ledger"
+   * behaviour: the numbers on disk are the truth, and everything recorded
+   * afterwards folds on top of them via {@link Ledger.record}.
+   *
+   * `effectiveTokens` is recomputed rather than trusted: a record written by an
+   * older build (or hand-edited) may not carry the field, and a missing weight
+   * would silently make the ceiling judge raw tokens again.
+   *
+   * @param usage - the record to install; `sessionId` is the key.
+   */
+  restore(usage: SessionUsage): void {
+    const effectiveTokens =
+      usage.uncachedInputTokens +
+      usage.cacheReadTokens * CACHE_READ_WEIGHT +
+      usage.cacheWriteTokens +
+      usage.outputTokens
+    this.bySession.set(usage.sessionId, { ...usage, effectiveTokens })
   }
 
   /**

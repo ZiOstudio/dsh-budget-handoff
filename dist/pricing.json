@@ -1,4 +1,16 @@
 {
+    "deepseek-account": {
+        "deepseek-flash": {
+            "cacheRead": { "offPeak": 0.02, "peak": 0.04 },
+            "cacheMiss": { "offPeak": 1.0, "peak": 2.0 },
+            "output": { "offPeak": 4.0, "peak": 8.0 }
+        },
+        "deepseek-v4-flash": {
+            "cacheRead": { "offPeak": 0.02, "peak": 0.04 },
+            "cacheMiss": { "offPeak": 1.0, "peak": 2.0 },
+            "output": { "offPeak": 4.0, "peak": 8.0 }
+        }
+    },
     "deepseek-official": {
         "deepseek-flash": {
             "cacheRead": { "offPeak": 0.02, "peak": 0.04 },

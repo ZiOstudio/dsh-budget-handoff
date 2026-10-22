@@ -44,6 +44,21 @@ const twoValues = parseBudgetCommand('/budget 5 6');
 check('two amounts are rejected', twoValues !== null && twoValues.kind === 'invalid', JSON.stringify(twoValues));
 const longGarbage = parseBudgetCommand(`/budget ${'x'.repeat(80)}`);
 check('a long bad argument is clipped in the reason', longGarbage !== null && longGarbage.kind === 'invalid' && longGarbage.reason.length < 60, `reason length = ${longGarbage !== null && longGarbage.kind === 'invalid' ? longGarbage.reason.length : 'n/a'}`);
+// ── token ceiling ───────────────────────────────────────────────────────────
+const tokensBare = parseBudgetCommand('/budget tokens');
+check('bare token subcommand is a query', tokensBare !== null && tokensBare.kind === 'query', JSON.stringify(tokensBare));
+const tokensSet = parseBudgetCommand('/budget tokens 200000');
+check('token ceiling parses', tokensSet !== null && tokensSet.kind === 'set-tokens' && tokensSet.tokenBudget === 200_000, JSON.stringify(tokensSet));
+const tokensSpaced = parseBudgetCommand('/budget   TOKENS   1500000');
+check('token subcommand is case-insensitive and tolerates spacing', tokensSpaced !== null && tokensSpaced.kind === 'set-tokens' && tokensSpaced.tokenBudget === 1_500_000, JSON.stringify(tokensSpaced));
+const tokensRounded = parseBudgetCommand('/budget tokens 12345.6');
+check('fractional token counts round to whole tokens', tokensRounded !== null && tokensRounded.kind === 'set-tokens' && tokensRounded.tokenBudget === 12_346, JSON.stringify(tokensRounded));
+const tokensTooSmall = parseBudgetCommand('/budget tokens 10');
+check('a ceiling below one call is rejected', tokensTooSmall !== null && tokensTooSmall.kind === 'invalid', JSON.stringify(tokensTooSmall));
+const tokensNotANumber = parseBudgetCommand('/budget tokens abc');
+check('non-numeric token ceiling is rejected, not ignored', tokensNotANumber !== null && tokensNotANumber.kind === 'invalid', JSON.stringify(tokensNotANumber));
+// A bare `/budget tokens` must never be mistaken for "set the budget to NaN".
+check('token subcommand never falls through to the money parser', tokensBare?.kind === 'query', JSON.stringify(tokensBare));
 // ── not a command ───────────────────────────────────────────────────────────
 check('plain Chinese sentence is not a command', parseBudgetCommand('看看当前目录有哪些文件') === null, 'null');
 check('prefix without separator is not a command', parseBudgetCommand('/budgetx 5') === null, 'null');
@@ -57,16 +72,27 @@ check('returns null when no message is a command', noneFound === null, JSON.stri
 const emptyBatch = findBudgetCommand([]);
 check('returns null for an empty batch', emptyBatch === null, JSON.stringify(emptyBatch));
 // ── receipts ────────────────────────────────────────────────────────────────
-const setReceipt = renderReceipt({ kind: 'set', budgetCNY: 5 }, 5, 0.32);
+const setReceipt = renderReceipt({ kind: 'set', budgetCNY: 5 }, 5, 0.32, 12_000, 5_000_000);
 check('set receipt reports the new budget and the spend', setReceipt === '[预算] 本会话预算已设为 5.0000 元（已用 0.3200 元）', setReceipt);
-const queryReceipt = renderReceipt({ kind: 'query' }, 5, 0.32);
-check('query receipt reports budget, spend and remainder', queryReceipt === '[预算] 本会话预算 5.0000 元，已用 0.3200 元，剩余 4.6800 元', queryReceipt);
-const overspentReceipt = renderReceipt({ kind: 'query' }, 1, 3);
+const setTokensReceipt = renderReceipt({ kind: 'set-tokens', tokenBudget: 200_000 }, 5, 0.32, 12_000, 200_000);
+check('set-tokens receipt reports the new ceiling and the usage', setTokensReceipt === '[预算] 本会话 Token 上限已设为 200,000；已用 12,000', setTokensReceipt);
+const queryReceipt = renderReceipt({ kind: 'query' }, 5, 0.32, 12_000, 5_000_000);
+check('query receipt reports budget, spend and remainder, then the token line', queryReceipt ===
+    '[预算] 本会话预算 5.0000 元，已用 0.3200 元，剩余 4.6800 元\n[预算] Token 上限 5,000,000，已用 12,000', queryReceipt);
+const overspentReceipt = renderReceipt({ kind: 'query' }, 1, 3, 12_000, 5_000_000);
 check('remainder never goes negative', overspentReceipt.includes('剩余 0.0000 元'), overspentReceipt);
-const invalidReceipt = renderReceipt({ kind: 'invalid', reason: '「abc」不是数字' }, 10, 1);
+const invalidReceipt = renderReceipt({ kind: 'invalid', reason: '「abc」不是数字' }, 10, 1, 0, 5_000_000);
 check('invalid receipt says nothing changed', invalidReceipt.includes('预算没有改动'), invalidReceipt);
-check('invalid receipt shows the usage', invalidReceipt.includes(`\`${COMMAND_PREFIX} 5\``), invalidReceipt);
-check('every receipt carries the plugin prefix', [setReceipt, queryReceipt, invalidReceipt].every((r) => r.startsWith('[预算] ')), '3/3 start with [预算]');
+check('invalid receipt shows the money usage', invalidReceipt.includes(`\`${COMMAND_PREFIX} 5\``), invalidReceipt);
+check('invalid receipt shows the token usage', invalidReceipt.includes(`\`${COMMAND_PREFIX} tokens 200000\``), invalidReceipt);
+check('every receipt carries the plugin prefix', [setReceipt, setTokensReceipt, queryReceipt, invalidReceipt].every((r) => r.startsWith('[预算] ')), '4/4 start with [预算]');
+// ── 折算后 Token 的回执（缓存命中按 0.1 计）──────────────────────────────────
+const weightedQuery = renderReceipt({ kind: 'query' }, 5, 0.32, 120_000, 5_000_000, 12_000);
+check('query shows both raw and weighted when they differ', weightedQuery.includes('已用 120,000（折算后 12,000，缓存读取按 0.1 计）'), weightedQuery);
+const sameQuery = renderReceipt({ kind: 'query' }, 5, 0.32, 12_000, 5_000_000, 12_000);
+check('query stays quiet when weighted equals raw', sameQuery === '[预算] 本会话预算 5.0000 元，已用 0.3200 元，剩余 4.6800 元\n[预算] Token 上限 5,000,000，已用 12,000', sameQuery);
+const weightedSetTokens = renderReceipt({ kind: 'set-tokens', tokenBudget: 200_000 }, 5, 0.32, 120_000, 200_000, 12_000);
+check('set-tokens receipt also discloses the weighting', weightedSetTokens.includes('已用 120,000（折算后 12,000，缓存读取按 0.1 计）'), weightedSetTokens);
 console.log(failed === 0 ? '--- RESULT: ALL PASS ---' : `--- RESULT: ${failed} FAILED ---`);
 if (failed !== 0)
     process.exitCode = 1;

@@ -21,8 +21,8 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 > **想固定在某个版本**（不随主分支漂移，便于复现同样的行为），在末尾加版本号：
 >
 > ```sh
-> dsh plugin --profile <你的profile> add dsh-budget-handoff@0.2.2
-> dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff#v0.2.2
+> dsh plugin --profile <你的profile> add dsh-budget-handoff@0.4.0
+> dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff#v0.4.0
 > ```
 >
 > 源码安装会从 npm 拉开发依赖来跑构建；若被 pnpm 拦下，按提示把该包加进 profile 的 `allowBuilds`，或直接改用上面的 npm 包。
@@ -34,6 +34,7 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 | `/budget 5` | 本会话预算设为 5 元 |
 | `/budget` | 查还剩多少 |
 | `/budget 20` | 不够了，提到 20 元（**要填比已花掉的钱更大的数**） |
+| `/budget tokens 200000` | 本会话 Token 上限设为 20 万（**只有金额算不出来时才管用**，见下文） |
 
 发出去会立刻回你一句：
 
@@ -88,6 +89,39 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 打开快照可以看到「干到哪了 / 动过哪些文件 / 怎么接着干」。
 ```
 
+### 价目表里没有这个模型 —— 改用 Token 把关
+
+金额是靠价目表算出来的。会话一旦切到价目表没收录的 provider/model（自建中转、新模型、别人家的
+provider），**金额就永远不再增长** —— 它不涨，也就永远不会超支，金额闸门等于没了。
+
+这时候插件不会装死，而是换一把尺子：**Token 数**。它对每一笔调用都存在，不需要任何价格。
+
+- **它平时是关着的。** 只有当本会话真的出现过「算不出价」的调用，Token 闸门才会启动 ——
+  所以全程都有价的正常会话，不会因为这条规则被提前掐断。
+- **默认上限 500 万 Token**（约等于 10 元按 Flash 输出价算出来的量级，再放宽一倍）。
+  要调：`/budget tokens 200000`。
+- **缓存命中的 Token 按十分之一计。** DeepSeek 的缓存命中价是未命中价的 1/50，如果按原样计数，
+  一段长对话会把 500 万这个额度迅速顶满，而实际只花了几分钱。所以判闸门时缓存读取按 0.1 折算；
+  回执和通知里会把「折算后」和「原始」两个数一起写出来，对账时不会觉得插件少算了。
+- 换尺子这件事会在会话里明确告诉你：
+
+```
+[预算] 价目表里没有 workbuddy-ai/deepseek-v4.1-flash-sg 的价格
+后果：本会话的金额不再累计（它不涨，也就不会再拦停），但 Token 数照记
+现在的保护：Token 上限 5,000,000，已用 128,400（折算后 34,200，缓存读取按 0.1 计）
+要调上限：`/budget tokens <数量>`；想恢复金额把关：补 dist/pricing.json 或换已知模型
+```
+
+- 停下来的通知也会换说法，**不会**让你去调金额（调了也没用）：
+
+```
+[预算] Token 用量已达上限，任务已停止
+累计 Token：5,120,000 / 上限 5,000,000（折算后；原始 6,300,000，缓存读取按 0.1 计）（金额因 37 次调用无价目表而未累计）
+```
+
+> 想彻底恢复「按钱管」，两条路：把该模型的价格补进 `dist/pricing.json`，或者换回价目表里的模型。
+> 补价之后金额闸门立刻恢复，Token 闸门对**新会话**不再启动。
+
 ### 停住之后 —— 打开那份交接单
 
 在**你自己的工作目录**里找 `BUDGET-STOPPED-handoff-snapshot.md`。它长这样：
@@ -98,7 +132,9 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 - 生成时间：2026-10-08 04:12:07.518 (UTC+8)
 - 会话 ID：session-…
 - 触发位置：turn=8, step=2
+- 触发口径：金额（5.0234 元 / 5.0000 元）
 - 累计消费：5.0234 元 / 预算 5.0000 元
+- 累计 Token：812,345 / 上限 5,000,000
 
 ## 这个任务要做什么
 <你在会话里说的第一句话>
@@ -150,18 +186,34 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 >
 > **不确定花了多少？先发一个 `/budget` 看一眼。**
 
+**如果是 Token 闸门停的，调金额没用** —— 那种情况下通知里会直接告诉你 `累计 Token：… / 上限 …`，
+照那个数发 `/budget tokens <更大的数>`，再说「继续」。快照的「怎么接着干」一节也会写对是哪一条。
+
 ### `/budget` 的完整语法
 
 | 你发 | 结果 |
 |---|---|
-| `/budget` | 查询当前预算与已用 |
+| `/budget` | 查询当前预算与已用（金额 + Token 两行） |
 | `/budget 5` | 本会话预算设为 5 元 |
 | `/budget 0.5` / `/budget 12.75` | 小数可以 |
 | `/budget    5` | 中间多打空格无所谓 |
 | `/Budget 5` / `/BUDGET 5` | 大小写随便混 |
+| `/budget tokens 200000` | 本会话 Token 上限设为 200,000 |
+| `/budget tokens` | 查询（等同于 `/budget`） |
+| `/budget tokens 10` | 拒绝（低于下限 `1000`，一次调用就超了） |
 | `/budget abc` | 明确告诉你格式不对，并给出用法 |
 | `/budget 0` / `/budget -1` | 拒绝（低于下限 `0.0001`） |
 | `/budgetx 5`、`预算 5` | **不是命令** —— 前缀必须独立，或后面跟一个空格 |
+
+### 重启之后 —— 账不会清零
+
+关掉 DSH 再打开，同一个会话接着聊时，**已经花掉的钱和 Token 都还在**。
+
+- 存在哪：`<$DSH_HOME>\storages\dsh-budget-handoff\sessions.json`，一个会话一条记录。
+- 存什么：累计消费、四个 Token 桶、折算后的 Token、未计价调用次数，以及你给这个会话设的金额上限与 Token 上限。
+- 什么时候写：每记一笔账后最多等 2 秒（连续记账只写一次），进程正常退出时再补一次。
+- 什么时候清：超过 30 天的会话、以及只留最新 50 个会话，其余在下次启动时被丢掉。
+- 坏处也要说清楚：这个文件是**明文**的，里面有会话 ID 和花费数字，没有对话内容。想从零开始，删掉它即可。
 
 ### 账户余额耗尽怎么办
 
@@ -192,7 +244,7 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 
 ## 配置（一般不用动）
 
-默认预算是 **10 元**。要改全局默认值，在 profile 的 `cordis.patch.yml` 里给插件加 `config:`：
+默认预算是 **10 元**，默认 Token 上限 **500 万**。要改全局默认值，在 profile 的 `cordis.patch.yml` 里给插件加 `config:`：
 
 ```yaml
 - insert:
@@ -200,14 +252,20 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
       name: dsh-budget-handoff
       config:
         budgetCNY: 20.0
+        tokenBudget: 10000000
 ```
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `budgetCNY` | number | `10.0` | 每会话预算，单位人民币元；下限 `0.0001`。**单个会话的临时覆盖请用 `/budget`，不要改这里。** |
+| `tokenBudget` | number | `5000000` | 每会话 Token 上限；下限 `1000`。**只在价目表算不出价时生效**，全程有价的会话不受影响。临时覆盖用 `/budget tokens`。 |
 | `verbose` | boolean | `false` | 打开后把逐笔用量与计费打进 stdout。默认关闭 —— 一次普通任务**一行都不打**，只留启动横幅、拦截提示和卸载证明 |
 
 也可以完全不给 `config:` —— schema 会回填默认值。
+
+> 500 万这个默认值怎么来的：10 元按 Flash 输出价（4 元 / 百万 token）约合 250 万输出 token，
+> 再按「输入输出大致 1:1」的常见比例放宽一倍。它是量级估计，不是精确换算 —— 真按这个数管
+> 预算时，请按你的实际模型和用量自己定。
 
 ---
 
@@ -239,13 +297,13 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 > 偏差方向是保守的（不会超支），但节假日跑长任务会被提前拦停。需要精确时，改
 > `src/pricing.ts` 的 `isPeakHour()`，把节假日日期一并纳入判断。
 
-表里查不到的 provider/model 不会按 0 虚报，而是**明确告诉你保护失效了**：
+表里查不到的 provider/model 不会按 0 虚报，也不会静默失效 —— 它**改用 Token 把关，并明确告诉你**：
 
 ```
-[预算] ⚠️ 预算保护已失效
-原因：价目表里没有 <provider>/<model> 的价格，本插件无法为它计费
-后果：本会话的消费不再累计，也不会在超支时拦停
-怎么修：改用价目表里已有的模型，或把该模型的价格补进 dist/pricing.json（安装包里的价目表）
+[预算] 价目表里没有 <provider>/<model> 的价格
+后果：本会话的金额不再累计（它不涨，也就不会再拦停），但 Token 数照记
+现在的保护：Token 上限 5,000,000，已用 128,400
+要调上限：`/budget tokens <数量>`；想恢复金额把关：补 dist/pricing.json 或换已知模型
 ```
 
 （同一会话里同一个模型只提示一次。）
@@ -256,10 +314,12 @@ dsh plugin --profile <你的profile> add github:ZiOstudio/dsh-budget-handoff
 
 1. **单步会话不会触发拦截**：闸门在「下一步开始前」，如果会话只有一步，那一步执行完就没有「下一步」可拦。
 2. **拦截后 CLI 退出码为 1**：任务被拒绝，CLI 以非零码结束。
-3. **只覆盖 `deepseek-official`**：其他 provider 走「价格未知 → 保护失效 → 明确告知」。
-4. **跨进程不累计**：累计消费与 `/budget` 设的预算都是内存值，进程重启即归零，也不跨会话共享。
+3. **金额只覆盖 `deepseek-official`**：其他 provider 的调用不计金额，改由 Token 闸门兜底（见上文）。
+4. **跨会话不共享**：累计消费、Token 用量、`/budget` 与 `/budget tokens` 设的上限都按会话隔离，A 会话花的钱不算进 B 会话。
+   重启 DSH 后这些数会从磁盘恢复（见下文「重启之后」），但**只恢复最近 30 天、最多 50 个会话**，更旧的会被清掉。
 5. **法定节假日未建模**：节假日仍按工作日窗口判高峰（见上文警告）。
 6. **价格不会自动更新**：官方调价需要手动改 `dist/pricing.json`（改 `src/pricing.json` 则要重新构建）并重新安装插件。
+7. **Token 上限是量级而非精确等值**：默认 500 万按 Flash 的价折算放宽，换成 Pro 或别的模型时，同一个 Token 数对应的钱可能差好几倍。要按钱管，请补价目表而不是依赖 Token 上限。
 
 ---
 
@@ -270,8 +330,10 @@ pnpm install
 pnpm run build              # tsc → dist/
 
 node dist/command.test.js   # /budget 口令解析与回执
+node dist/gate.test.js      # 闸门判定：哪个口径在管、超没超
 node dist/harvest.test.js   # 交接痕迹采集
-node dist/ledger.test.js    # 账本累加
+node dist/ledger.test.js    # 账本累加与缓存折算
+node dist/persist.test.js   # 跨重启状态：读写、原子写、裁剪
 node dist/pricing.test.js   # 价格/时段
 node dist/snapshot.test.js  # 快照渲染与写盘
 ```
@@ -281,12 +343,16 @@ node dist/snapshot.test.js  # 快照渲染与写盘
 ### 内部时钟（给改代码的人看）
 
 ```
-session/event       →  只记录：记账、攒任务痕迹、排队待发通知
+session/event       →  只记录：记账（金额 + Token）、攒任务痕迹、排队待发通知
                        ⚠️ 不要在这里 session.append()：实测发不出去
-agent/pre-step      →  口令处理 / 拦停 / 80% 预警
+agent/pre-step      →  口令处理 / 拦停（金额或 Token）/ 80% 预警
 agent/turn-stopping →  80% 预警兜底（单步会话或停在最后一步时）
 agent/request-error →  余额耗尽兜底
 ```
+
+**闸门只有一个**：`src/gate.ts` 的 `judge(state, limits)` 是纯函数，同时看金额与 Token，
+返回「哪个口径在管、比例多少、超没超」。80% 预警和拦停都问它 —— 两者不可能对「还剩多少」给出不同答案。
+Token 口径由 `unpricedCalls > 0` 点火：会话出现过算不出价的调用，才启用。
 
 ---
 

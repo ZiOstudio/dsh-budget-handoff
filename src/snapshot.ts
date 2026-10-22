@@ -28,6 +28,32 @@ export interface SnapshotInput {
   spentCNY: number
   /** Budget that was exceeded, in CNY. */
   budgetCNY: number
+  /**
+   * Which ceiling actually stopped the run.
+   *
+   * The snapshot has to say this out loud: "stopped at 4.9 元 of a 5 元 budget"
+   * and "stopped at 5,100,000 tokens of a 5,000,000 ceiling" are two different
+   * stories, and a reader who only sees the CNY line would look for a money
+   * problem that does not exist.
+   */
+  basis: 'money' | 'tokens'
+  /**
+   * Weighted tokens the ceiling actually judges — cache reads count at a
+   * discount (see `ledger.ts`). This is the number that tripped the gate.
+   */
+  tokens: number
+  /**
+   * Raw billed tokens, before the cache discount.
+   *
+   * Written beside {@link tokens} so a reader comparing this hand-off note with
+   * a provider invoice can see why the two numbers differ; without it the
+   * plugin looks like it under-counted.
+   */
+  rawTokens?: number
+  /** Token ceiling in force for the session. */
+  tokenBudget: number
+  /** How many of the session's calls the price table could not price. */
+  unpricedCalls: number
   /** Human-readable reason, e.g. "session spent 1.2345 CNY >= budget 1.0000 CNY". */
   reason: string
   /** Structured trace of the run, folded by `harvest` (P5-1). */
@@ -65,6 +91,24 @@ function beijingNow(): string {
 /** Render the snapshot as Markdown. Pure function: no I/O, one clock read. */
 export function buildSnapshot(input: SnapshotInput): string {
   const { trace } = input
+  // 两个口径各写一行，谁先撞线谁在前 —— 读者不需要自己比大小。
+  const weighted = input.tokens.toLocaleString('en-US')
+  const raw = (input.rawTokens ?? input.tokens).toLocaleString('en-US')
+  const weightNote =
+    input.rawTokens !== undefined && input.rawTokens !== input.tokens
+      ? `（折算后；原始 ${raw}，缓存读取按 0.1 计）`
+      : ''
+  const usageLine =
+    input.basis === 'tokens'
+      ? `- 触发口径：Token 上限（${weighted} / ${Math.round(input.tokenBudget).toLocaleString('en-US')}）${weightNote}`
+      : `- 触发口径：金额（${input.spentCNY.toFixed(4)} 元 / ${input.budgetCNY.toFixed(4)} 元）`
+  const moneyLine = `- 累计消费：${input.spentCNY.toFixed(4)} 元 / 预算 ${input.budgetCNY.toFixed(4)} 元${
+    input.unpricedCalls > 0
+      ? `（其中 ${input.unpricedCalls} 次调用的模型不在价目表里，未计入金额）`
+      : ''
+  }`
+  const tokenLine = `- 累计 Token：${weighted} / 上限 ${Math.round(input.tokenBudget).toLocaleString('en-US')}${weightNote}`
+
   const lines: string[] = [
     '# DSH 预算交接快照',
     '',
@@ -72,7 +116,9 @@ export function buildSnapshot(input: SnapshotInput): string {
     `- 会话 ID：${input.sessionId}`,
     `- 触发位置：turn=${input.turn}, step=${input.step}`,
     `- 触发原因：${input.reason}`,
-    `- 累计消费：${input.spentCNY.toFixed(4)} 元 / 预算 ${input.budgetCNY.toFixed(4)} 元`,
+    usageLine,
+    moneyLine,
+    tokenLine,
     '',
     '## 这个任务要做什么',
     '',
@@ -104,7 +150,10 @@ export function buildSnapshot(input: SnapshotInput): string {
     '## 怎么接着干',
     '',
     '1. 先看上面的「动过哪些文件」，逐个确认改动是否完整。',
-    '2. 把本会话预算调大。',
+    // 提示的必须是**真正卡住的那个上限**，否则用户照做之后照样被拦一次。
+    input.basis === 'tokens'
+      ? '2. 把本会话的 Token 上限调大：`/budget tokens <数量>`。'
+      : '2. 把本会话预算调大：`/budget <金额>`。',
     '3. 说一句「继续」——本快照已同时注入模型上下文，模型能看到断点。',
     '',
     `## 详细事件（最近 ${MAX_RECENT_EVENTS} 条，供排查）`,

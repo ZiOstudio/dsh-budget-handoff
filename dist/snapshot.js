@@ -39,6 +39,19 @@ function beijingNow() {
 /** Render the snapshot as Markdown. Pure function: no I/O, one clock read. */
 export function buildSnapshot(input) {
     const { trace } = input;
+    // 两个口径各写一行，谁先撞线谁在前 —— 读者不需要自己比大小。
+    const weighted = input.tokens.toLocaleString('en-US');
+    const raw = (input.rawTokens ?? input.tokens).toLocaleString('en-US');
+    const weightNote = input.rawTokens !== undefined && input.rawTokens !== input.tokens
+        ? `（折算后；原始 ${raw}，缓存读取按 0.1 计）`
+        : '';
+    const usageLine = input.basis === 'tokens'
+        ? `- 触发口径：Token 上限（${weighted} / ${Math.round(input.tokenBudget).toLocaleString('en-US')}）${weightNote}`
+        : `- 触发口径：金额（${input.spentCNY.toFixed(4)} 元 / ${input.budgetCNY.toFixed(4)} 元）`;
+    const moneyLine = `- 累计消费：${input.spentCNY.toFixed(4)} 元 / 预算 ${input.budgetCNY.toFixed(4)} 元${input.unpricedCalls > 0
+        ? `（其中 ${input.unpricedCalls} 次调用的模型不在价目表里，未计入金额）`
+        : ''}`;
+    const tokenLine = `- 累计 Token：${weighted} / 上限 ${Math.round(input.tokenBudget).toLocaleString('en-US')}${weightNote}`;
     const lines = [
         '# DSH 预算交接快照',
         '',
@@ -46,7 +59,9 @@ export function buildSnapshot(input) {
         `- 会话 ID：${input.sessionId}`,
         `- 触发位置：turn=${input.turn}, step=${input.step}`,
         `- 触发原因：${input.reason}`,
-        `- 累计消费：${input.spentCNY.toFixed(4)} 元 / 预算 ${input.budgetCNY.toFixed(4)} 元`,
+        usageLine,
+        moneyLine,
+        tokenLine,
         '',
         '## 这个任务要做什么',
         '',
@@ -74,7 +89,11 @@ export function buildSnapshot(input) {
         for (const file of trace.touchedFiles)
             lines.push(`- \`${file}\``);
     }
-    lines.push('', '## 怎么接着干', '', '1. 先看上面的「动过哪些文件」，逐个确认改动是否完整。', '2. 把本会话预算调大。', '3. 说一句「继续」——本快照已同时注入模型上下文，模型能看到断点。', '', `## 详细事件（最近 ${MAX_RECENT_EVENTS} 条，供排查）`, '');
+    lines.push('', '## 怎么接着干', '', '1. 先看上面的「动过哪些文件」，逐个确认改动是否完整。', 
+    // 提示的必须是**真正卡住的那个上限**，否则用户照做之后照样被拦一次。
+    input.basis === 'tokens'
+        ? '2. 把本会话的 Token 上限调大：`/budget tokens <数量>`。'
+        : '2. 把本会话预算调大：`/budget <金额>`。', '3. 说一句「继续」——本快照已同时注入模型上下文，模型能看到断点。', '', `## 详细事件（最近 ${MAX_RECENT_EVENTS} 条，供排查）`, '');
     const recent = input.recentEvents.slice(-MAX_RECENT_EVENTS);
     if (recent.length === 0) {
         lines.push('- （无）');

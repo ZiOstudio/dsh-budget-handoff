@@ -18,6 +18,10 @@ const input: SnapshotInput = {
   step: 3,
   spentCNY: 1.2345,
   budgetCNY: 1,
+  basis: 'money',
+  tokens: 812_345,
+  tokenBudget: 5_000_000,
+  unpricedCalls: 0,
   reason: 'session spent 1.2345 CNY >= budget 1.0000 CNY',
   trace: {
     goal: '补齐 src/ 下的单元测试',
@@ -53,6 +57,9 @@ check('标题', markdown.startsWith('# DSH 预算交接快照\n'), `首行 = ${m
 check('会话 ID', markdown.includes(`- 会话 ID：${input.sessionId}`), input.sessionId)
 check('触发位置', markdown.includes('- 触发位置：turn=2, step=3'), 'turn=2, step=3')
 check('累计消费', markdown.includes('- 累计消费：1.2345 元 / 预算 1.0000 元'), '1.2345 元 / 预算 1.0000 元')
+check('累计 Token 行', markdown.includes('- 累计 Token：812,345 / 上限 5,000,000'), '812,345 / 5,000,000')
+check('触发口径行（金额）', markdown.includes('- 触发口径：金额（1.2345 元 / 1.0000 元）'), '金额')
+check('金额口径不写「无价目表」注记', !markdown.includes('不在价目表里'), 'unpricedCalls = 0')
 
 check('第一节标题', markdown.includes('## 这个任务要做什么'), '这个任务要做什么')
 check('goal 渲染', markdown.includes('补齐 src/ 下的单元测试'), '补齐 src/ 下的单元测试')
@@ -82,6 +89,52 @@ check(
   markdown.includes('- turn/start turn=2') && markdown.includes('- assistant/message usage total=10670'),
   '2 条各占一行',
 )
+
+console.log('--- buildSnapshot output (token basis, price-table gap) ---')
+const tokenBasis = buildSnapshot({
+  ...input,
+  basis: 'tokens',
+  spentCNY: 0.4321,
+  tokens: 5_120_000,
+  tokenBudget: 5_000_000,
+  unpricedCalls: 37,
+  reason: 'session used 5,120,000 tokens >= token ceiling 5,000,000 (money not accrued: price table gap)',
+})
+console.log(tokenBasis)
+
+check('触发口径行（Token）', tokenBasis.includes('- 触发口径：Token 上限（5,120,000 / 5,000,000）'), 'Token 上限')
+check(
+  '金额行注明有多少次调用没计入',
+  tokenBasis.includes('（其中 37 次调用的模型不在价目表里，未计入金额）'),
+  '37 次',
+)
+check(
+  '接着干给的是 Token 指令，不是金额指令',
+  tokenBasis.includes('`/budget tokens <数量>`') && !tokenBasis.includes('`/budget <金额>`'),
+  'tokens 指令优先',
+)
+check('金额口径仍给金额指令', markdown.includes('`/budget <金额>`'), 'money 口径不变')
+
+console.log('--- buildSnapshot output (raw vs weighted tokens) ---')
+const weighted = buildSnapshot({
+  ...input,
+  basis: 'tokens',
+  tokens: 12_000,
+  rawTokens: 120_000,
+  tokenBudget: 5_000_000,
+})
+check(
+  'Token 行同时给出折算值与原始值',
+  weighted.includes('- 累计 Token：12,000 / 上限 5,000,000（折算后；原始 120,000，缓存读取按 0.1 计）'),
+  '折算 12,000 / 原始 120,000',
+)
+check(
+  '触发口径行也标注折算',
+  weighted.includes('- 触发口径：Token 上限（12,000 / 5,000,000）（折算后；原始 120,000，缓存读取按 0.1 计）'),
+  '两个数都出现',
+)
+const noRaw = buildSnapshot({ ...input, basis: 'tokens', tokens: 5_120_000, tokenBudget: 5_000_000 })
+check('没有原始值时不多嘴', !noRaw.includes('折算后'), 'rawTokens 缺省时保持原样')
 
 console.log('--- buildSnapshot output (empty trace) ---')
 const empty = buildSnapshot({ ...input, trace: emptyTrace(null), recentEvents: [] })

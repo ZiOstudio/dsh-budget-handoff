@@ -12,9 +12,14 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import z from '@deepseek-ai/schemastery'
 import { COMMAND_PREFIX, findBudgetCommand, renderReceipt } from './command.js'
+import { judge } from './gate.js'
+import type { GateState } from './gate.js'
 import { emptyTrace, harvest } from './harvest.js'
 import type { TaskTrace } from './harvest.js'
-import { Ledger } from './ledger.js'
+import { CACHE_READ_WEIGHT, Ledger } from './ledger.js'
+import type { SessionUsage } from './ledger.js'
+import { loadState, pruneSessions, saveState } from './persist.js'
+import type { PersistedState } from './persist.js'
 import { calculateCost, isPeakHour } from './pricing.js'
 import { buildSnapshot, writeSnapshot, writeSnapshotToDshHome, MAX_RECENT_EVENTS } from './snapshot.js'
 
@@ -42,6 +47,18 @@ export interface Config {
    */
   budgetCNY: number
   /**
+   * 每会话 Token 上限（默认 5000000），只在「价目表里没有这个模型的价格」时才生效。
+   *
+   * 为什么需要它：金额闸门依赖价目表，一旦会话切到价目表没收录的 provider/model，
+   * 金额就永远不再增长，闸门等于失效。Token 数是唯一对每一笔调用都存在、且不依赖
+   * 价目表的量，所以用它兜底。
+   *
+   * 默认值怎么来的：10 元按 Flash 输出价（4 元 / 百万）约合 250 万输出 token；
+   * 再按输入输出大致 1:1 的常见比例放大一倍，取 500 万。它是个「够用又不至于失控」
+   * 的量级，不是精确换算。
+   */
+  tokenBudget: number
+  /**
    * 把逐笔用量与计费写成 stdout 日志（默认 false）。
    *
    * 默认只留三样：启动横幅（告诉你它在岗）、拦截时的终端提示、卸载证明。
@@ -52,6 +69,7 @@ export interface Config {
 
 export const Config: z<Config> = z.object({
   budgetCNY: z.number().min(0.0001).default(10.0),
+  tokenBudget: z.number().min(1000).default(5_000_000),
   verbose: z.boolean().default(false),
 })
 
@@ -123,9 +141,12 @@ function recallMessage(text: string) {
 export function apply(ctx: Context, config: Config) {
   // Cumulative token accounting, one record per session.
   const ledger = new Ledger()
-
   // Cumulative CNY spend, one total per session.
   const sessionCosts = new Map<string, number>()
+
+  // 每会话「价目表算不出来的调用」计数。> 0 表示金额这个数已经不可信，
+  // 于是 Token 闸门接管（见 gate.ts 的模块头注释）。
+  const unpricedCallsBySession = new Map<string, number>()
 
   // 每会话的最近事件摘要（环缓冲），供交接快照的 recentEvents 使用。
   const recentEventsBySession = new Map<string, string[]>()
@@ -138,6 +159,10 @@ export function apply(ctx: Context, config: Config) {
   // 这既是「每个会话各自设上限」的实现，也是被拦之后唯一能自救的入口。
   const sessionBudgets = new Map<string, number>()
 
+  // 每会话单独设定的 Token 上限（`/budget tokens <数量>`）。没有条目时回退到 config 默认值。
+  // 存在的理由同上，但专门服务「价目表没收录这个模型」的会话。
+  const sessionTokenBudgets = new Map<string, number>()
+
   // 已经就「价目表里没有这个模型」警告过的 `会话|provider/model`，避免每一步都刷一条。
   const uncoveredWarned = new Set<string>()
 
@@ -146,6 +171,77 @@ export function apply(ctx: Context, config: Config) {
 
   // 已经提示过 80% 预警的会话。只提示一次 —— 每一步都提醒等于噪音。
   const warnedAt80 = new Set<string>()
+
+  // ── 跨重启的会话状态 ────────────────────────────────────────────────────────
+  // 上面所有 Map 都只活在进程里：DSH 一重启（含桌面版自动更新），本会话已经花掉的
+  // 钱和 Token 就归零，闸门等于被悄悄调高到「无限」。用户要的是「跟会话走，不跟
+  // 进程走」，所以启动时把上一进程写下的数字读回来，之后每记一笔再写回去。
+  const persisted: PersistedState = loadState()
+  for (const entry of Object.values(persisted.sessions)) {
+    if (entry.usage !== undefined && entry.usage !== null) ledger.restore(entry.usage)
+    if (typeof entry.spentCNY === 'number' && entry.spentCNY > 0) {
+      sessionCosts.set(entry.sessionId, entry.spentCNY)
+    }
+    if (typeof entry.unpricedCalls === 'number' && entry.unpricedCalls > 0) {
+      unpricedCallsBySession.set(entry.sessionId, entry.unpricedCalls)
+    }
+    if (typeof entry.budgetCNY === 'number') sessionBudgets.set(entry.sessionId, entry.budgetCNY)
+    if (typeof entry.tokenBudget === 'number') sessionTokenBudgets.set(entry.sessionId, entry.tokenBudget)
+  }
+  const restoredCount = Object.keys(persisted.sessions).length
+
+  /** 上次落盘的时刻，用于把高频写入压成低频（见 {@link persistSession}）。 */
+  let lastPersistAt = 0
+
+  /** 两次自动落盘之间的最小间隔（毫秒）。命令与拦停不受此限。 */
+  const PERSIST_INTERVAL_MS = 2_000
+
+  /**
+   * 把一个会话的当前数字搬进内存里的 `persisted`（不落盘）。
+   *
+   * 抽出来是为了让「卸载前一次性写盘」复用同一套字段拼装：两处各写一遍，
+   * 迟早会漏掉某个字段，而漏掉的字段在重启后表现为「这个数莫名其妙变小了」。
+   *
+   * @param sessionId - 要同步的会话。
+   * @param now - 写进 `updatedAt` 的时刻，裁剪按它排序。
+   * @returns 是否真的写入了（没记过账的会话返回 false）。
+   */
+  function mergePersisted(sessionId: string, now: number = Date.now()): boolean {
+    const usage = ledger.get(sessionId)
+    if (usage === null) return false
+
+    persisted.sessions[sessionId] = {
+      sessionId,
+      updatedAt: now,
+      usage,
+      spentCNY: sessionCosts.get(sessionId) ?? 0,
+      unpricedCalls: unpricedCallsBySession.get(sessionId) ?? 0,
+      ...(sessionBudgets.has(sessionId) ? { budgetCNY: sessionBudgets.get(sessionId) as number } : {}),
+      ...(sessionTokenBudgets.has(sessionId)
+        ? { tokenBudget: sessionTokenBudgets.get(sessionId) as number }
+        : {}),
+    }
+    return true
+  }
+
+  /**
+   * 把一个会话的当前数字写回状态文件。
+   *
+   * 为什么要有节流：`session/event` 每来一条 assistant 消息就会调一次，而一次
+   * 同步写盘在一个长任务里可能被调几百次。丢 2 秒的计数是可恢复的，卡住主线程不是。
+   * 用户主动改上限、或闸门真的拦停时传 `force`，那两处必须立刻落盘。
+   */
+  function persistSession(sessionId: string, force = false): void {
+    const now = Date.now()
+    if (!force && now - lastPersistAt < PERSIST_INTERVAL_MS) return
+    lastPersistAt = now
+
+    if (!mergePersisted(sessionId, now)) return
+    // 写盘前顺手裁剪：只在启动时裁，一个长跑进程会把所有见过的会话都留在文件里，
+    // 上限就成了「每次重启检查一次」。裁剪是纯函数，同一套规则两个入口。
+    persisted.sessions = pruneSessions(persisted.sessions, now)
+    saveState(persisted)
+  }
 
   /**
    * 待发送的会话通知，按会话排队。
@@ -174,6 +270,30 @@ export function apply(ctx: Context, config: Config) {
   }
 
   /**
+   * 本会话生效的 Token 上限：单独设过就用单独设的，否则用全局默认。
+   * 与 {@link budgetFor} 同形，理由同上（同一个东西只写一遍）。
+   */
+  function tokenBudgetFor(sessionId: string): number {
+    return sessionTokenBudgets.get(sessionId) ?? config.tokenBudget
+  }
+
+  /**
+   * 把三处散落的累计量收成一个闸门输入。
+   *
+   * 抽出来是为了让「预警」和「拦停」问同一个函数 —— 它们曾经各自算一遍比例，
+   * 迟早会分叉成「预警说还剩一点、闸门说已经超了」。
+   */
+  function gateStateFor(sessionId: string): GateState {
+    return {
+      spentCNY: sessionCosts.get(sessionId) ?? 0,
+      // 闸门判的是**折算后**的 Token：缓存命中按 CACHE_READ_WEIGHT 打折（见
+      // ledger.ts 的模块注释）。原始计数照旧记着，回执里会一起报出来。
+      tokens: ledger.get(sessionId)?.effectiveTokens ?? 0,
+      unpricedCalls: unpricedCallsBySession.get(sessionId) ?? 0,
+    }
+  }
+
+  /**
    * 80% 预警：累计到这个比例就插一条通知（每会话一次），只提示、不拦截。
    *
    * 为什么要有两个调用点 ——「哪一刻算到 80%」取决于任务的形状：
@@ -185,22 +305,35 @@ export function apply(ctx: Context, config: Config) {
    *
    * @param append - 插消息的通道；传回调而不是传 `Session`，避免这里依赖包级类型。
    */
-  function warnAt80IfNeeded(
-    sessionId: string,
-    spentCNY: number,
-    budgetCNY: number,
-    append: (text: string) => void,
-  ): void {
-    if (spentCNY < budgetCNY * WARN_AT_FRACTION) return
+  function warnAt80IfNeeded(sessionId: string, append: (text: string) => void): void {
+    const verdict = judge(gateStateFor(sessionId), {
+      budgetCNY: budgetFor(sessionId),
+      tokenBudget: tokenBudgetFor(sessionId),
+    })
+    if (verdict.ratio < WARN_AT_FRACTION) return
     if (warnedAt80.has(sessionId)) return
+
+    const state = gateStateFor(sessionId)
+    // 报告**当前更紧的那个**口径，而不是永远报钱：会话一旦有算不出价的调用，
+    // 钱这个数就是静止的，拿它报「还剩多少」是在骗人。
+    // Token 那一行报的是折算后的数（闸门就是按它判的），同时给出原始数，
+    // 否则用户拿账单一对会发现「插件少算了」。
+    const recorded = ledger.get(sessionId)
+    const lines: string[] =
+      verdict.tightest === 'tokens'
+        ? [
+            `[预算] Token 已用 ${state.tokens.toLocaleString('en-US')}（折算后；原始 ${(recorded?.totalTokens ?? 0).toLocaleString('en-US')}，缓存读取按 ${CACHE_READ_WEIGHT} 计），达到本会话上限 ${Math.round(tokenBudgetFor(sessionId)).toLocaleString('en-US')} 的 ${Math.round(verdict.ratio * 100)}%`,
+            `原因：本会话有 ${state.unpricedCalls} 次调用用的模型不在价目表里，金额无法累计，改用 Token 计数把关。`,
+            `超限时任务会被停下，并写一份交接快照。要提高上限：\`${COMMAND_PREFIX} tokens <数量>\``,
+          ]
+        : [
+            `[预算] 已用 ${state.spentCNY.toFixed(4)} 元，达到本会话预算 ${budgetFor(sessionId).toFixed(4)} 元的 ${Math.round(verdict.ratio * 100)}%`,
+            `剩余 ${Math.max(0, budgetFor(sessionId) - state.spentCNY).toFixed(4)} 元。钱花完时任务会被停下，并写一份交接快照。`,
+            `要提高预算：\`${COMMAND_PREFIX} <金额>\``,
+          ]
+
     try {
-      append(
-        [
-          `[预算] 已用 ${spentCNY.toFixed(4)} 元，达到本会话预算 ${budgetCNY.toFixed(4)} 元的 ${Math.round(WARN_AT_FRACTION * 100)}%`,
-          `剩余 ${Math.max(0, budgetCNY - spentCNY).toFixed(4)} 元。钱花完时任务会被停下，并写一份交接快照。`,
-          `要提高预算：\`/budget <金额>\``,
-        ].join('\n'),
-      )
+      append(lines.join('\n'))
       warnedAt80.add(sessionId)
     } catch (err) {
       console.error(`[dsh-budget-handoff] failed to append 80% warning: ${String(err)}`)
@@ -218,6 +351,8 @@ export function apply(ctx: Context, config: Config) {
     turn: number
     step: number
     reason: string
+    /** 真正卡住的那个口径；决定快照与通知怎么措辞。 */
+    basis: 'money' | 'tokens'
     spentCNY: number
     budgetCNY: number
     workdir: string
@@ -227,12 +362,19 @@ export function apply(ctx: Context, config: Config) {
     appendNotice: (text: string) => void
     injectContext: (text: string) => void
   }): void {
+    const state = gateStateFor(options.sessionId)
+    const tokenBudget = tokenBudgetFor(options.sessionId)
     const snapshot = buildSnapshot({
       sessionId: options.sessionId,
       turn: options.turn,
       step: options.step,
       spentCNY: options.spentCNY,
       budgetCNY: options.budgetCNY,
+      basis: options.basis,
+      tokens: state.tokens,
+      rawTokens: ledger.get(options.sessionId)?.totalTokens ?? state.tokens,
+      tokenBudget,
+      unpricedCalls: state.unpricedCalls,
       reason: options.reason,
       trace: taskTracesBySession.get(options.sessionId) ?? emptyTrace(options.workdir),
       recentEvents: recentEventsBySession.get(options.sessionId) ?? [],
@@ -278,12 +420,19 @@ export function apply(ctx: Context, config: Config) {
       )
     }
 
+    // 通知正文只报**真正卡住的那个数**，另一个口径放在括号里当背景。
+    // 报错口径的后果很实在：用户照着「把预算调大」做了一遍，还是被拦。
+    const usedLine =
+      options.basis === 'tokens'
+        ? `累计 Token：${state.tokens.toLocaleString('en-US')} / 上限 ${Math.round(tokenBudget).toLocaleString('en-US')}（金额因 ${state.unpricedCalls} 次调用无价目表而未累计）`
+        : `累计消费：${options.spentCNY.toFixed(4)} 元 / 预算：${options.budgetCNY.toFixed(4)} 元`
+
     try {
       options.appendNotice(
         [
           options.headline,
           ...(options.extraLine !== undefined ? [options.extraLine] : []),
-          `累计消费：${options.spentCNY.toFixed(4)} 元 / 预算：${options.budgetCNY.toFixed(4)} 元`,
+          usedLine,
           ...writtenLines,
           '打开快照可以看到「干到哪了 / 动过哪些文件 / 怎么接着干」。',
         ].join('\n'),
@@ -298,9 +447,7 @@ export function apply(ctx: Context, config: Config) {
 
     console.error(`[dsh-budget-handoff] ${options.headline}`)
     if (options.extraLine !== undefined) console.error(`[dsh-budget-handoff] ${options.extraLine}`)
-    console.error(
-      `[dsh-budget-handoff] 累计消费：${options.spentCNY.toFixed(4)} 元 / 预算：${options.budgetCNY.toFixed(4)} 元`,
-    )
+    console.error(`[dsh-budget-handoff] ${usedLine}`)
     for (const line of writtenLines) console.error(`[dsh-budget-handoff] ${line}`)
   }
 
@@ -367,32 +514,43 @@ export function apply(ctx: Context, config: Config) {
           }
 
         } else {
+          // 金额算不出来 —— 从这一刻起金额闸门是瞎的。但 Token 数照常记（上面
+          // ledger.record 已经做了），所以「至少把它记上」这件事在这里是成立的：
+          // 这个分支唯一的副作用就是给 Token 闸门点一次火。
+          const sessionKey = String(session.id)
+          unpricedCallsBySession.set(sessionKey, (unpricedCallsBySession.get(sessionKey) ?? 0) + 1)
+
           console.error(
-            `[dsh-budget-handoff] ⚠️ 未知 provider/model: ${provider}/${model} — 本插件无法为其计费，预算保护已失效`,
+            `[dsh-budget-handoff] ⚠️ 未知 provider/model: ${provider}/${model} — 无法按价目表计费，本会话改用 Token 计数把关`,
           )
           console.error(
-            `[dsh-budget-handoff]    如果你在用自定义 provider 或新模型，请更新 dist/pricing.json（安装包里的价目表）或换用已知模型`,
+            `[dsh-budget-handoff]    价目表可在 dist/pricing.json 补全；或换用已知模型，金额闸门会自动恢复`,
           )
 
-          // A7：把「保护已失效」从终端搬到会话里。GUI 用户看不到 stdout，原来那两句
-          // 警告等于没说 —— 用户会一直以为有预算保护，而刹车其实已经没了。
-          // 按 (会话, provider/model) 去重，否则每一步都刷一条。
-          const uncoveredKey = `${String(session.id)}|${provider}/${model}`
+          // A7：把这件事从终端搬到会话里。GUI 用户看不到 stdout，原来那两句
+          // 警告等于没说。按 (会话, provider/model) 去重，否则每一步都刷一条。
+          const uncoveredKey = `${sessionKey}|${provider}/${model}`
           if (!uncoveredWarned.has(uncoveredKey)) {
             uncoveredWarned.add(uncoveredKey)
             // 只入队，不在这里 append —— 原因见 pendingNoticesBySession 的注释。
-            const queue = pendingNoticesBySession.get(String(session.id)) ?? []
+            const queue = pendingNoticesBySession.get(sessionKey) ?? []
+            const ceiling = Math.round(tokenBudgetFor(sessionKey)).toLocaleString('en-US')
+            const recorded = ledger.get(sessionKey)
             queue.push(
               [
-                `[预算] ⚠️ 预算保护已失效`,
-                `原因：价目表里没有 ${provider}/${model} 的价格，本插件无法为它计费`,
-                `后果：本会话的消费不再累计，也不会在超支时拦停`,
-                `怎么修：改用价目表里已有的模型，或把该模型的价格补进 dist/pricing.json（安装包里的价目表）`,
+                `[预算] 价目表里没有 ${provider}/${model} 的价格`,
+                `后果：本会话的金额不再累计（它不涨，也就不会再拦停），但 Token 数照记`,
+                `现在的保护：Token 上限 ${ceiling}，已用 ${recorded?.totalTokens.toLocaleString('en-US') ?? 0}（折算后 ${Math.round(recorded?.effectiveTokens ?? 0).toLocaleString('en-US')}，缓存读取按 ${CACHE_READ_WEIGHT} 计）`,
+                `要调上限：\`${COMMAND_PREFIX} tokens <数量>\`；想恢复金额把关：补 dist/pricing.json 或换已知模型`,
               ].join('\n'),
             )
-            pendingNoticesBySession.set(String(session.id), queue)
+            pendingNoticesBySession.set(sessionKey, queue)
           }
         }
+
+        // 每记一笔就把本会话的数字落盘（带 2 秒节流）。这是「Token 累计跟会话走、
+        // 不随重启归零」的写入端：读回发生在 apply() 顶部，写在这里。
+        persistSession(String(session.id))
       }
     }
   })
@@ -427,8 +585,16 @@ export function apply(ctx: Context, config: Config) {
     const command = findBudgetCommand(payload.messages)
     if (command !== null) {
       if (command.kind === 'set') sessionBudgets.set(sessionId, command.budgetCNY)
-      const effective = budgetFor(sessionId)
-      const receipt = renderReceipt(command, effective, spent)
+      if (command.kind === 'set-tokens') sessionTokenBudgets.set(sessionId, command.tokenBudget)
+      const recorded = ledger.get(sessionId)
+      const receipt = renderReceipt(
+        command,
+        budgetFor(sessionId),
+        sessionCosts.get(sessionId) ?? 0,
+        recorded?.totalTokens ?? 0,
+        tokenBudgetFor(sessionId),
+        recorded?.effectiveTokens ?? 0,
+      )
       try {
         payload.agent.session.append(
           'user/message',
@@ -443,29 +609,50 @@ export function apply(ctx: Context, config: Config) {
       } catch (err) {
         console.error(`[dsh-budget-handoff] failed to append receipt: ${String(err)}`)
       }
+      // 改了上限就必须立刻落盘：用户敲这条命令往往正是因为下一步就会被拦，
+      // 此时重启一次却把新上限弄丢，等于这条命令白敲。
+      persistSession(sessionId, true)
       return { kind: 'reject' }
     }
 
-    if (spent >= budgetCNY) {
+    // 两个口径问同一个纯函数 —— 预警和拦停不可能对「还剩多少」给出不同答案。
+    const verdict = judge(gateStateFor(sessionId), {
+      budgetCNY,
+      tokenBudget: tokenBudgetFor(sessionId),
+    })
+
+    if (verdict.tripped.length > 0) {
       // 会话的真实工作目录在 SessionHeader 上（`session.header.cwd`），**不是**
       // `process.cwd()`：后者是宿主进程的启动目录（实测为 profiles\desktop），
       // 会把快照写进 DSH 自己的安装目录，用户在自己的工作区里根本找不到。
       const workdir = payload.agent.session?.header?.cwd ?? process.cwd()
+      const basis = verdict.tightest
+      // 拦停时两个数都写：原始值对账，折算值解释「为什么现在停」。只写折算值会让人
+      // 以为 Token 少算了；只写原始值会让人以为闸门坏了。
+      const recorded = ledger.get(sessionId)
+      const reason =
+        basis === 'tokens'
+          ? `session used ${Math.round(recorded?.effectiveTokens ?? 0).toLocaleString('en-US')} weighted tokens (${(recorded?.totalTokens ?? 0).toLocaleString('en-US')} raw, cache reads at ${CACHE_READ_WEIGHT}) >= token ceiling ${Math.round(tokenBudgetFor(sessionId)).toLocaleString('en-US')} (money not accrued: ${verdict.tokenArmed ? 'price table gap' : 'n/a'})`
+          : `session spent ${spent.toFixed(4)} CNY >= budget ${budgetCNY.toFixed(4)} CNY`
       writeHandoffOut({
         sessionId,
         turn: payload.turn,
         step: payload.step,
-        reason: `session spent ${spent.toFixed(4)} CNY >= budget ${budgetCNY.toFixed(4)} CNY`,
+        reason,
+        basis,
         spentCNY: spent,
         budgetCNY,
         workdir,
-        headline: '[预算] 预算已耗尽，任务已停止',
+        headline:
+          basis === 'tokens'
+            ? '[预算] Token 用量已达上限，任务已停止'
+            : '[预算] 预算已耗尽，任务已停止',
         // 如果这一步直接把累计从「还没到 80%」顶到了「超过 100%」，80% 预警就没有机会发
         // （pre-step 里超支分支在预警检查之前 return 了）。把「越过了预警线」这个事实并进
         // 拦停通知：信息不丢，又不必连发两条。已经提醒过的情况就不重复了。
         extraLine:
-          spent >= budgetCNY * WARN_AT_FRACTION && !warnedAt80.has(sessionId)
-            ? '注意：本次消费越过了 80% 预警线，但直到耗尽才停下。'
+          verdict.ratio >= 1 && !warnedAt80.has(sessionId)
+            ? '注意：本次用量越过了 80% 预警线，但直到触顶才停下。'
             : undefined,
         appendNotice: (text) => {
           payload.agent.session.append('user/message', noticeMessage(text), { surfaceOp: 'append' })
@@ -474,11 +661,14 @@ export function apply(ctx: Context, config: Config) {
           payload.agent.inject(recallMessage(text))
         },
       })
+      // 拦停是这一轮最重要的一次写盘：任务已经停了，用户可能马上重启 DSH 去
+      // 接着干，重启后必须还记得「这个会话已经用掉了多少」。
+      persistSession(sessionId, true)
       return { kind: 'reject' }
     }
 
     // 80% 预警：多步任务会在中途跨过阈值，这里当场提示。
-    warnAt80IfNeeded(sessionId, spent, budgetCNY, (text) => {
+    warnAt80IfNeeded(sessionId, (text) => {
       payload.agent.session.append('user/message', noticeMessage(text), { surfaceOp: 'append' })
     })
 
@@ -493,7 +683,7 @@ export function apply(ctx: Context, config: Config) {
   // 即用户看到的就是「这条消息跑完，预警自己冒出来」。
   ctx.on('agent/turn-stopping', (payload) => {
     const sessionId = String(payload.agent.session?.id ?? '')
-    warnAt80IfNeeded(sessionId, sessionCosts.get(sessionId) ?? 0, budgetFor(sessionId), (text) => {
+    warnAt80IfNeeded(sessionId, (text) => {
       payload.agent.session.append('user/message', noticeMessage(text), { surfaceOp: 'append' })
     })
   })
@@ -516,6 +706,8 @@ export function apply(ctx: Context, config: Config) {
           turn: payload.turn,
           step: payload.step,
           reason: `provider rejected the request: ${payload.provider} → ${code} (${payload.failure.message})`,
+          // 账户余额耗尽与「金额超预算」是同一类事：卡住的是钱。
+          basis: 'money',
           spentCNY: sessionCosts.get(sessionId) ?? 0,
           budgetCNY: budgetFor(sessionId),
           workdir: payload.agent.session?.header?.cwd ?? process.cwd(),
@@ -538,11 +730,26 @@ export function apply(ctx: Context, config: Config) {
   //    so the reversible-cleanup proof — the DISPOSED line on unload — survives.
   ctx.effect(() => {
     return () => {
+      // 卸载前把每个记过账的会话都写一遍（不受 2 秒节流限制）：插件被停用、
+      // 或宿主走正常退出流程时，最后两秒的记账否则就丢了。
+      // 逐个更新内存里的 persisted，最后只落盘一次 —— N 个会话写 N 次文件没有意义。
+      const all = ledger.getAll()
+      for (const usage of all) mergePersisted(usage.sessionId)
+      if (all.length > 0) {
+        const now = Date.now()
+        persisted.sessions = pruneSessions(persisted.sessions, now)
+        saveState(persisted)
+      }
       console.log(`[dsh-budget-handoff] DISPOSED — listeners removed`)
     }
   })
 
   console.log(
-    `[dsh-budget-handoff] 已加载，默认预算 ${config.budgetCNY} CNY（${COMMAND_PREFIX} <金额> 可按会话覆盖）`,
+    `[dsh-budget-handoff] 已加载，默认预算 ${config.budgetCNY} CNY、Token 上限 ${config.tokenBudget.toLocaleString('en-US')}（${COMMAND_PREFIX} <金额> / ${COMMAND_PREFIX} tokens <数量> 可按会话覆盖）`,
   )
+  // 读回了几条历史会话就说一句：这句话是「重启不清零」唯一的外部证据，
+  // 没有它，用户只能靠花掉一笔钱去反推功能是否生效。
+  if (restoredCount > 0) {
+    console.log(`[dsh-budget-handoff] 已从上次运行恢复 ${restoredCount} 个会话的累计用量`)
+  }
 }
